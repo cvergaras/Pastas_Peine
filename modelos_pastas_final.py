@@ -20,6 +20,7 @@ Estructura:
 # =============================================================================
 import os
 import warnings
+from multiprocessing import Pool, cpu_count
 import pandas as pd
 import pastas as ps
 import matplotlib.pyplot as plt
@@ -120,15 +121,30 @@ def calculate_model_statistics(model: ps.Model) -> dict:
     r2 = model.stats.rsq()
     rmse = model.stats.rmse()
     
+    bic = model.stats.bic()
+    
+    # Legates & McCabe (1999)
+    obs = model.oseries.series
+    sim = model.simulate()  # devuelve un pandas Series alineado con obs
+    
+    #std
+    std_obs = model.oseries.series.dropna().std()
+
+    # MAE
+    mae = np.mean(np.abs(sim - obs))
+    
     return {
         "R²": r2,
         "RMSE": rmse,
-        "p-value zero": p_value_t,
-        "t-statistic zero": t_stat,
+        "std_obs07": std_obs * 0.7,
+        # "p-value zero": p_value_t,
+        # "t-statistic zero": t_stat,
         "p-value wilconox": p_value_wilc,
-        "statistic wilconox": stat_wilc,
-        "p-value shapiro": p_value_shap,
-        "statistic shapiro": stat_shap
+        # "statistic wilconox": stat_wilc,
+        # "p-value shapiro": p_value_shap,
+        # "statistic shapiro": stat_shap,
+        "MAE": mae,
+        "BIC": bic,
     }
 
 
@@ -150,10 +166,11 @@ def calculate_ivm(row: pd.Series) -> str:
     """
     try:
         conditions = [
-            pd.notna(row["R²"]) and row["R²"] > 0.85,
-            pd.notna(row["RMSE"]) and row["RMSE"] < 0.05,
+            pd.notna(row["R²"]) and row["R²"] > 0.65, # R2 Premia modelos “suaves” que siguen la tendencia pero no los eventos. 
+            pd.notna(row["RMSE"]) and row["RMSE"] < row["std_obs07"],
             pd.notna(row["p-value wilconox"]) and row["p-value wilconox"] > 0.05,
-            pd.notna(row["p-value shapiro"]) and row["p-value shapiro"] > 0.05
+            pd.notna(row["MAE"]) and row["MAE"] < row["std_obs07"],
+            # pd.notna(row["p-value shapiro"]) and row["p-value shapiro"] > 0.05 # No se usa porque no funciona bien con muchos datos
         ]
         return "Válido" if all(conditions) else "No Válido"
     except (KeyError, TypeError):
@@ -460,7 +477,7 @@ for modelo in Modelos:
         # ml.add_noisemodel(ps.NoiseModel())
         
         # Calibrar modelo
-        ml.solve(report=False)
+        ml.solve(report=True)
         
         # Calcular estadísticas
         stats_dict = calculate_model_statistics(ml)
