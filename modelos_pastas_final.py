@@ -383,11 +383,14 @@ Modelos = ["Modelo_A", "Modelo_B", "Modelo_C", "Modelo_D", "Modelo_E"]
 niveles_series = niveles.copy()
 niveles_series.set_index("Fecha", inplace=True)
 location_names = niveles["Pozo"].unique()
+location_names = ["L10-1"]
 
 # Inicializar diccionarios para almacenar resultados
 modelos_individuales = {}
 model_stats = {}
 gains_data = []
+
+Modelos = ["Modelo_E"]
 
 # Iterar sobre cada modelo
 for modelo in Modelos:
@@ -477,7 +480,7 @@ for modelo in Modelos:
         # ml.add_noisemodel(ps.NoiseModel())
         
         # Calibrar modelo
-        ml.solve(report=True)
+        ml.solve(report=False)
         
         # Calcular estadísticas
         stats_dict = calculate_model_statistics(ml)
@@ -503,9 +506,19 @@ for modelo in Modelos:
         plt.close()
         
         # Calcular gains para modelos con WellModel
-        if modelo not in ["Modelo_A", "Modelo_B"]:
+        pozo_gains = {"pozo": pozo}
+        
+        if modelo in ["Modelo_C", "Modelo_D", "Modelo_E"]:
             wm = ml.stressmodels["WellModel"]
-            pozo_gains = {"pozo": pozo}
+                    # Definir nombres de estrés según modelo
+            if modelo == "Modelo_C":
+                stress_names = ["alb", "til", "tuc", "peine"]
+                
+            elif modelo == "Modelo_D":
+                stress_names = ["sop", "mop"]
+                
+            elif modelo == "Modelo_E":
+                stress_names = ["alb", "sop", "mop", "til", "tuc", "peine"]
             
             for i, name in enumerate(stress_names[:len(wm.stress)]):
                 p = wm.get_parameters(model=ml, istress=i)
@@ -513,6 +526,7 @@ for modelo in Modelos:
                 pozo_gains[name] = gain
             
             gains_data.append(pozo_gains)
+                  
     
     # =========================================================================
     # 8. EXPORTAR RESULTADOS
