@@ -1,15 +1,15 @@
 Pozo,Estadistico Z,Estadistico S,p-value,tendencia
-E1,3.926,1146,0.000,Creciente
-E2,0.502,138,0.615,Sin tendencia
-E3,-3.366,-919,0.000,Decreciente
-E4,-9.248,-2310,0.000,Decreciente
-LM-05,6.670,594,0.000,Creciente
-LM-06,0.593,103,0.552,Sin tendencia
-LM-07,-3.228,-820,0.001,Decreciente
-LM-08,-1.664,-294,0.095,Sin tendencia
-LM-09,3.924,1053,0.000,Creciente
-LM-10,1.467,328,0.142,Sin tendencia
+E1,4.730,994,0.000,Creciente
+E2,-0.233,-55,0.815,Sin tendencia
+E3,-4.751,-1102,0.000,Decreciente
+E4,-8.420,-1915,0.000,Decreciente
+LM-05,6.766,581,0.000,Creciente
+LM-06,1.256,202,0.209,Sin tendencia
+LM-07,-2.797,-611,0.005,Decreciente
+LM-08,-1.241,-195,0.214,Sin tendencia
+LM-09,2.628,610,0.008,Creciente
+LM-10,2.271,468,0.023,Creciente
 LM-17,-5.145,-729,0.000,Decreciente
-REGLILLA INTERNA CONAF,-5.107,-420,0.000,Decreciente
-REGLILLA SALADA CONAF,-2.247,-498,0.024,Decreciente
-REGLILLA SALADITA CONAF,-5.934,-1560,0.000,Decreciente
+REGLILLA INTERNA CONAF,0.000,0,1.000,Sin tendencia
+REGLILLA SALADA CONAF,0.430,60,0.666,Sin tendencia
+REGLILLA SALADITA CONAF,-2.788,-469,0.005,Decreciente

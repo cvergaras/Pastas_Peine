@@ -18,6 +18,7 @@ Estructura:
 # =============================================================================
 # 1. IMPORTS Y CONFIGURACIÓN
 # =============================================================================
+
 import os
 import warnings
 from multiprocessing import Pool, cpu_count
@@ -27,19 +28,21 @@ import matplotlib.pyplot as plt
 import pymannkendall as mk
 import numpy as np
 from scipy import stats
-
+import time
 # Suprimir deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Configurar nivel de logging de Pastas
 ps.set_log_level("ERROR")
-ps.show_versions()
 
 # Crear directorio para plots
 os.makedirs("plots", exist_ok=True)
 
+# Multiprocessing: 1 = secuencial (más fácil de depurar), >1 = paralelo por tipo de modelo
+N_WORKERS = cpu_count() - 1  # ej. 4 o cpu_count() - 1 para acelerar
+
 # =============================================================================
-# 2. FUNCIONES AUXILIARES
+# 2.1 FUNCIONES AUXILIARES
 # =============================================================================
 
 def load_pumping_data(filepath: str) -> pd.Series:
@@ -141,10 +144,10 @@ def calculate_model_statistics(model: ps.Model) -> dict:
         # "t-statistic zero": t_stat,
         "p-value wilconox": p_value_wilc,
         # "statistic wilconox": stat_wilc,
-        # "p-value shapiro": p_value_shap,
         # "statistic shapiro": stat_shap,
         "MAE": mae,
         "BIC": bic,
+        "p-value shapiro": p_value_shap,
     }
 
 
@@ -177,48 +180,6 @@ def calculate_ivm(row: pd.Series) -> str:
         return "No Válido"
 
 
-# =============================================================================
-# 3. CARGA Y PREPARACIÓN DE DATOS DE NIVELES
-# =============================================================================
-print("\n=== 3. CARGANDO DATOS DE NIVELES ===")
-
-# Leer datos de niveles de pozos
-niveles_path = os.path.join("datos", "pozos nivel peine", "Niveles.csv")
-niveles = pd.read_csv(niveles_path, encoding="utf-8-sig")
-
-# Limpiar y estandarizar datos
-niveles["Fecha"] = pd.to_datetime(niveles["Fecha"], dayfirst=True, errors="coerce")
-niveles["Valor"] = pd.to_numeric(niveles["Valor"], errors="coerce")
-niveles["Pozo"] = niveles["Pozo"].astype(str).str.strip()
-niveles["Tipo"] = niveles["Tipo"].astype(str).str.strip().str.upper()
-niveles = niveles.dropna(subset=["Fecha", "Pozo", "Tipo", "Valor"]).copy()
-
-# Filtrar por fecha de inicio
-inicio = pd.Timestamp("2000-01-01")
-inicio2 = pd.Timestamp("1998-01-01")
-niveles = niveles[niveles["Fecha"] >= inicio].copy()
-
-# Filtrar solo pozos permitidos (según archivo de monitoreo)
-monitoreo_path = os.path.join("datos", "pozos nivel peine", "monitoreo_total.csv")
-monitoreo = pd.read_csv(monitoreo_path, encoding="utf-8-sig")
-allowed = (
-    monitoreo["Nombre"]
-    .astype(str)
-    .str.strip()
-    .str.replace(r"^Pozo\\s+", "", regex=True)
-    .dropna()
-    .unique()
-)
-niveles = niveles[niveles["Pozo"].isin(set(allowed))].copy()
-
-print(f"Total de registros de niveles: {len(niveles)}")
-print(f"Pozos únicos: {niveles['Pozo'].nunique()}")
-
-# =============================================================================
-# 4. ANÁLISIS DE TENDENCIAS (MANN-KENDALL)
-# =============================================================================
-print("\n=== 4. ANÁLISIS DE TENDENCIAS ===")
-
 def _trunc3(x: float) -> float:
     """Trunca a 3 decimales (no redondea)."""
     return float(np.trunc(float(x) * 1000.0) / 1000.0)
@@ -227,7 +188,6 @@ def _trunc3(x: float) -> float:
 def _mk_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aplica test de Mann-Kendall a cada pozo para detectar tendencias.
-    
     Retorna tabla con estadísticos Z, S, p-value y tendencia (Creciente/
     Decreciente/Sin tendencia).
     """
@@ -255,315 +215,364 @@ def _mk_table(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(mk_results)
 
 
-# Aplicar test a diferentes grupos de pozos
-exclude_head = {"PP-03", "MP-07C-1", "MP-07A", "L10-1", "PP-01", "MP-08A", "BA-30"}
-
-mk_head = _mk_table(niveles[(niveles["Tipo"] == "HEAD") & (~niveles["Pozo"].isin(exclude_head))])
-mk_head_excl = _mk_table(niveles[(niveles["Tipo"] == "HEAD") & (niveles["Pozo"].isin(exclude_head))])
-mk_stage = _mk_table(niveles[niveles["Tipo"] == "STAGE"])
-
-# Exportar resultados
-mk_head.to_csv("resultados_mann_kendall_head.csv", index=False, float_format="%.3f")
-mk_head_excl.to_csv("resultados_mann_kendall_head_excluidos.csv", index=False, float_format="%.3f")
-mk_stage.to_csv("resultados_mann_kendall_limnimetricos.csv", index=False, float_format="%.3f")
-
-print(f"MK HEAD: {len(mk_head)} pozos")
-print(f"MK HEAD excluidos: {len(mk_head_excl)} pozos")
-print(f"MK STAGE: {len(mk_stage)} pozos")
-
 # =============================================================================
-# 5. CARGA DE DATOS DE ESTRÉS (CLIMA Y BOMBEOS)
+# 2.2 FUNCIONES PARA CONSTRUIR MODELOS (se usan en secuencial y en paralelo)
 # =============================================================================
-print("\n=== 5. CARGANDO DATOS DE ESTRÉS ===")
 
-# 5.1 Precipitación y Evaporación
-archivos_precipitacion = [
-    os.path.join('datos', 'resultados_meteo', 'precip', 'Prec_CHAXA.csv'),
-    os.path.join('datos', 'resultados_meteo', 'precip', 'Prec_LZA9-1 (Interna).csv'),
-    os.path.join('datos', 'resultados_meteo', 'precip', 'Prec_LZA10-1.csv')
-]
-archivos_evaporacion = [
-    os.path.join('datos', 'resultados_meteo', 'evap', 'Evap_CHAXA.csv'),
-    os.path.join('datos', 'resultados_meteo', 'evap', 'Evap_LZA9-1 (Interna).csv')
-]
 
-# Concatenar y promediar múltiples estaciones
-precipitacion_list = [pd.read_csv(archivo, index_col=0, parse_dates=True).squeeze("columns") 
-                      for archivo in archivos_precipitacion]
-precipitacion = pd.concat(precipitacion_list).groupby(level=0).mean()
+def get_data_bundle():
+    """
+    Agrupa todos los datos necesarios para construir modelos.
+    Se llama desde el bloque principal después de cargar niveles, estrés y coordenadas.
+    """
+    return {
+        "niveles_series": niveles_series,
+        "coordenadas_niveles": coordenadas_niveles,
+        "coordenadas_bombeos": coordenadas_bombeos,
+        "sm_precip": sm_precip,
+        "sm_evap": sm_evap,
+        "ALB_series": ALB_series,
+        "SOP_series": SOP_series,
+        "MOP_series": MOP_series,
+        "TIL_series": TIL_series,
+        "TUC_series": TUC_series,
+        "PEINE_series": PEINE_series,
+    }
 
-evaporacion_list = [pd.read_csv(archivo, index_col=0, parse_dates=True).squeeze("columns") 
-                    for archivo in archivos_evaporacion]
-evaporacion = pd.concat(evaporacion_list).groupby(level=0).mean()
 
-# 5.2 Datos de Bombeo (usando función auxiliar)
-print("Cargando datos de bombeo...")
-ALB_series = load_pumping_data(os.path.join("datos", "pumping", "alb_pump.csv"))
-SOP_series = load_pumping_data(os.path.join("datos", "pumping", "SOP_monthly_m3.csv"))
-MOP_series = load_pumping_data(os.path.join("datos", "pumping", "MOP_monthly_m3.csv"))
-TIL_series = load_pumping_data(os.path.join("datos", "pumping", "tilopozo_pumping.csv"))
-TUC_series = load_pumping_data(os.path.join("datos", "pumping", "tucucaro_pumping.csv"))
-PEINE_series = load_pumping_data(os.path.join("datos", "pumping", "pozo_peine_pumping.csv"))
+def create_model_with_data(modelo: str, location_names: list, data: dict):
+    """
+    Construye y calibra un modelo Pastas para cada pozo usando solo los datos en `data`.
+    Así la misma función sirve en secuencial y en workers paralelos.
 
-# Organizar series de bombeo
-bombeos_dic = {
-    "alb": ALB_series, "sop": SOP_series, "mop": MOP_series,
-    "til": TIL_series, "tuc": TUC_series, "peine": PEINE_series
-}
-list_of_bombeos = [ALB_series, SOP_series, MOP_series, TIL_series, TUC_series, PEINE_series]
-stress_names = ["alb", "sop", "mop", "til", "tuc", "peine"]
+    Returns:
+        model_stats: dict {nombre_pozo: {estadísticas}}
+        gains_data: list de dicts con gains por pozo (solo Modelo_C/D/E).
+    """
+    ns = data["niveles_series"]
+    coord_n = data["coordenadas_niveles"]
+    coord_b = data["coordenadas_bombeos"]
+    sm_prec = data["sm_precip"]
+    sm_ev = data["sm_evap"]
+    ALB = data["ALB_series"]
+    SOP = data["SOP_series"]
+    MOP = data["MOP_series"]
+    TIL = data["TIL_series"]
+    TUC = data["TUC_series"]
+    PEINE = data["PEINE_series"]
 
-# 5.3 Preparar clima para modelos (resample a diario)
-precipitacion.index = pd.to_datetime(precipitacion.index, errors="coerce")
-precipitacion = precipitacion.dropna().sort_index()
-precipitacion_monthly = precipitacion.resample("D").sum()
-
-evaporacion.index = pd.to_datetime(evaporacion.index, errors="coerce")
-evaporacion = evaporacion.dropna().sort_index()
-evaporacion_monthly = evaporacion.resample("D").mean()
-
-# Preparar series para modelos Pastas
-prec = precipitacion.dropna().sort_index().resample("D").sum()
-evap = evaporacion.dropna().sort_index().resample("D").mean()
-
-# Crear StressModels para clima
-coef = 0.225  # Coeficiente de infiltracion SRK Consulting (2020) Zona Marginal (promedio)
-sm_precip = ps.StressModel(prec * coef, ps.Gamma(), settings="prec", name="precipitacion")
-sm_evap = ps.StressModel(evap, ps.Gamma(), settings="evap", name="evaporacion")
-
-print("Datos de estrés cargados correctamente")
-
-# =============================================================================
-# 6. CARGA DE COORDENADAS
-# =============================================================================
-print("\n=== 6. CARGANDO COORDENADAS ===")
-
-coordenadas_bombeos_path = os.path.join("datos", "pumping", "bombeos_ubicacion.csv")
-coordenadas_bombeos = pd.read_csv(coordenadas_bombeos_path, encoding="utf-8-sig")
-try:
-    coordenadas_bombeos.set_index("Nombre", inplace=True)
-except Exception as e:
-    print(f"Error loading coordenadas_bombeos: {e}")
-    raise
-
-coordenadas_niveles_path = os.path.join("datos", "pozos nivel peine", "monitoreo_total.csv")
-try:
-    coordenadas_niveles = pd.read_csv(coordenadas_niveles_path, encoding="utf-8-sig")
-    if "Nombre" in coordenadas_niveles.columns:
-        coordenadas_niveles.set_index("Nombre", inplace=True)
-    else:
-        print(f"Warning: 'Nombre' column not found. Available columns: {coordenadas_niveles.columns.tolist()}")
-        # Try alternative column name
-        if "nombre" in coordenadas_niveles.columns.str.lower():
-            col_name = coordenadas_niveles.columns[coordenadas_niveles.columns.str.lower() == "nombre"][0]
-            coordinadas_niveles.set_index(col_name, inplace=True)
-except Exception as e:
-    print(f"Error loading coordenadas_niveles: {e}")
-    raise
-
-print(f"Coordenadas de {len(coordenadas_bombeos)} bombeos cargadas")
-print(f"Coordenadas de {len(coordenadas_niveles)} pozos cargadas")
-
-# =============================================================================
-# 7. CONSTRUCCIÓN DE MODELOS PASTAS
-# =============================================================================
-print("\n=== 7. CONSTRUYENDO MODELOS PASTAS ===")
-
-# Definir modelos a construir
-Modelos = ["Modelo_A", "Modelo_B", "Modelo_C", "Modelo_D", "Modelo_E"]
-
-# Descripción de cada modelo:
-# Modelo_A: Solo recarga (precipitación + evaporación)
-# Modelo_B: Recarga + bombeo Albemarle (Hantush)
-# Modelo_C: Recarga + Albemarle + pozos de agua (WellModel: alb, til, tuc, peine)
-# Modelo_D: Recarga + SOP + MOP (WellModel)
-# Modelo_E: Recarga + todos los bombeos (WellModel: alb, sop, mop, til, tuc, peine)
-
-# Preparar datos de niveles para modelos
-niveles_series = niveles.copy()
-niveles_series.set_index("Fecha", inplace=True)
-location_names = niveles["Pozo"].unique()
-location_names = ["L10-1"]
-
-# Inicializar diccionarios para almacenar resultados
-modelos_individuales = {}
-model_stats = {}
-gains_data = []
-
-Modelos = ["Modelo_E"]
-
-# Iterar sobre cada modelo
-for modelo in Modelos:
-    print(f"\n--- Procesando {modelo} ---")
-    
-    # Reiniciar gains_data para cada modelo
+    model_stats = {}
     gains_data = []
-    
-    # Iterar sobre pozos (actualmente solo L10-1, pero puede expandirse)
+
     for pozo in location_names:
-        print(f"  Pozo: {pozo}")
-        
-        # Preparar serie de observaciones
-        datos = niveles_series[niveles_series["Pozo"] == pozo]["Valor"]
+        # 1. Serie de niveles del pozo
+        print(f"Creando modelo para {pozo} - {modelo}")
+        datos = ns[ns["Pozo"] == pozo]["Valor"]
         datos.index = pd.to_datetime(datos.index, errors="coerce")
         datos = datos.dropna().sort_index().resample("D").mean()
-        
-        # Crear modelo Pastas
+
+        # 2. Modelo: observación + recarga
         ml = ps.Model(datos, name=f"{pozo} - {modelo}")
-        
-        # Agregar recarga (siempre presente)
-        ml.add_stressmodel(sm_precip)
-        ml.add_stressmodel(sm_evap)
-        
-        # Agregar estrés según tipo de modelo
+        ml.add_stressmodel(sm_prec)
+        ml.add_stressmodel(sm_ev)
+
+        # 3. Estrés de bombeo según tipo de modelo
         if modelo == "Modelo_B":
-            # Solo bombeo Albemarle con Hantush
-            sm_alb = ps.StressModel(ALB_series, ps.Hantush(), name="albemarle", 
-                                   up=False, settings="well")
+            sm_alb = ps.StressModel(ALB, ps.Hantush(), name="albemarle", up=False, settings="well")
             ml.add_stressmodel(sm_alb)
-            
         elif modelo == "Modelo_C":
-            # WellModel con Albemarle + pozos de agua
-            este_pozo = float(coordenadas_niveles.loc[pozo]["Este"])
-            norte_pozo = float(coordenadas_niveles.loc[pozo]["Norte"])
-            
-            distances = []
-            bombeos_modelo = ["alb", "til", "tuc", "peine"]
-            series_modelo = [ALB_series, TIL_series, TUC_series, PEINE_series]
-            
-            for bombeo in bombeos_modelo:
-                este_bombeo = float(coordenadas_bombeos.loc[bombeo]["Este"])
-                norte_bombeo = float(coordenadas_bombeos.loc[bombeo]["Norte"])
-                distance_bombeo = distancia_utm(este_bombeo, norte_bombeo, este_pozo, norte_pozo)
-                distances.append(distance_bombeo)
-            
-            sm_bombeo = ps.WellModel(series_modelo, "WellModel", distances)
-            ml.add_stressmodel(sm_bombeo)
-            
+            este_pozo = float(coord_n.loc[pozo]["Este"])
+            norte_pozo = float(coord_n.loc[pozo]["Norte"])
+            bombeos = ["alb", "til", "tuc", "peine"]
+            series = [ALB, TIL, TUC, PEINE]
+            dist = [distancia_utm(float(coord_b.loc[b]["Este"]), float(coord_b.loc[b]["Norte"]), este_pozo, norte_pozo) for b in bombeos]
+            ml.add_stressmodel(ps.WellModel(series, "WellModel", dist))
         elif modelo == "Modelo_D":
-            # WellModel con SOP + MOP
-            este_pozo = float(coordenadas_niveles.loc[pozo]["Este"])
-            norte_pozo = float(coordenadas_niveles.loc[pozo]["Norte"])
-            
-            distances = []
-            bombeos_modelo = ["sop", "mop"]
-            series_modelo = [SOP_series, MOP_series]
-            
-            for bombeo in bombeos_modelo:
-                este_bombeo = float(coordenadas_bombeos.loc[bombeo]["Este"])
-                norte_bombeo = float(coordenadas_bombeos.loc[bombeo]["Norte"])
-                distance_bombeo = distancia_utm(este_bombeo, norte_bombeo, este_pozo, norte_pozo)
-                distances.append(distance_bombeo)
-            
-            sm_bombeo = ps.WellModel(series_modelo, "WellModel", distances)
-            ml.add_stressmodel(sm_bombeo)
-            
+            este_pozo = float(coord_n.loc[pozo]["Este"])
+            norte_pozo = float(coord_n.loc[pozo]["Norte"])
+            bombeos = ["sop", "mop"]
+            series = [SOP, MOP]
+            dist = [distancia_utm(float(coord_b.loc[b]["Este"]), float(coord_b.loc[b]["Norte"]), este_pozo, norte_pozo) for b in bombeos]
+            ml.add_stressmodel(ps.WellModel(series, "WellModel", dist))
         elif modelo == "Modelo_E":
-            # WellModel con todos los bombeos
-            este_pozo = float(coordenadas_niveles.loc[pozo]["Este"])
-            norte_pozo = float(coordenadas_niveles.loc[pozo]["Norte"])
-            
-            distances = []
-            bombeos_modelo = ["alb", "sop", "mop", "til", "tuc", "peine"]
-            series_modelo = [ALB_series, SOP_series, MOP_series, TIL_series, TUC_series, PEINE_series]
-            
-            for bombeo in bombeos_modelo:
-                este_bombeo = float(coordenadas_bombeos.loc[bombeo]["Este"])
-                norte_bombeo = float(coordenadas_bombeos.loc[bombeo]["Norte"])
-                distance_bombeo = distancia_utm(este_bombeo, norte_bombeo, este_pozo, norte_pozo)
-                distances.append(distance_bombeo)
-            
-            sm_bombeo = ps.WellModel(series_modelo, "WellModel", distances)
-            ml.add_stressmodel(sm_bombeo)
+            este_pozo = float(coord_n.loc[pozo]["Este"])
+            norte_pozo = float(coord_n.loc[pozo]["Norte"])
+            bombeos = ["alb", "sop", "mop", "til", "tuc", "peine"]
+            series = [ALB, SOP, MOP, TIL, TUC, PEINE]
+            dist = [distancia_utm(float(coord_b.loc[b]["Este"]), float(coord_b.loc[b]["Norte"]), este_pozo, norte_pozo) for b in bombeos]
+            ml.add_stressmodel(ps.WellModel(series, "WellModel", dist))
         
-        # Agregar noisemodel (Optional)
-        # ml.add_noisemodel(ps.NoiseModel())
+        # 5. Calibrar y guardar estadísticas
+        # 5.1 Sin noisemodel para generar buenos valores iniciales
+        ml.solve(report=False,tmin="2013-01-01",tmax="2023-12-01",warmup=720)
         
-        # Calibrar modelo
-        ml.solve(report=False)
-        
-        # Calcular estadísticas
-        stats_dict = calculate_model_statistics(ml)
-        modelos_individuales[f"{pozo}_{modelo}"] = ml
-        model_stats[(pozo, modelo)] = stats_dict
-        
-        # Guardar gráficos
+        # 5.2 Con noisemodel (ArmaNoiseModel) para reducir autocorrelación de los residuales
+        ml.add_noisemodel(ps.ArmaNoiseModel())
+        ml.solve(initial=False,tmin="2013-01-01",tmax="2023-12-01",warmup=720,report=True)
+        model_stats[pozo] = calculate_model_statistics(ml)
+
+        # 6. Gráfico
         os.makedirs(modelo, exist_ok=True)
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6), gridspec_kw={'width_ratios': [4, 1]})
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6), gridspec_kw={"width_ratios": [4, 1]})
         ml.plot(ax=axes[0])
-        axes[0].set_ylabel('Nivel de agua [msnm]')
-        axes[0].set_title(f'{modelo} - {pozo}')
-        axes[0].ticklabel_format(axis='y', style='plain', useOffset=False)
-        
-        residuals = ml.residuals()
-        axes[1].hist(residuals, bins=25, edgecolor='black', orientation='horizontal')
-        axes[1].set_xlabel('Frecuencia')
-        axes[1].set_ylabel('Residuales')
-        axes[1].set_title('Residuales')
-        
+        axes[0].set_ylabel("Nivel de agua [msnm]")
+        axes[0].set_title(f"{modelo} - {pozo}")
+        axes[0].ticklabel_format(axis="y", style="plain", useOffset=False)
+        axes[1].hist(ml.residuals(), bins=25, edgecolor="black", orientation="horizontal")
+        axes[1].set_xlabel("Frecuencia")
+        axes[1].set_ylabel("Residuales")
+        axes[1].set_title("Residuales")
         plt.tight_layout()
         fig.savefig(os.path.join(modelo, f"{modelo}_{pozo}.png"), dpi=200)
         plt.close()
-        
-        # Calcular gains para modelos con WellModel
-        pozo_gains = {"pozo": pozo}
-        
+
+        # 7. Gains (solo Modelo_C, D, E)
         if modelo in ["Modelo_C", "Modelo_D", "Modelo_E"]:
             wm = ml.stressmodels["WellModel"]
-                    # Definir nombres de estrés según modelo
             if modelo == "Modelo_C":
-                stress_names = ["alb", "til", "tuc", "peine"]
-                
+                names = ["alb", "til", "tuc", "peine"]
             elif modelo == "Modelo_D":
-                stress_names = ["sop", "mop"]
-                
-            elif modelo == "Modelo_E":
-                stress_names = ["alb", "sop", "mop", "til", "tuc", "peine"]
-            
-            for i, name in enumerate(stress_names[:len(wm.stress)]):
+                names = ["sop", "mop"]
+            else:
+                names = ["alb", "sop", "mop", "til", "tuc", "peine"]
+            pozo_gains = {"pozo": pozo}
+            for i, name in enumerate(names[: len(wm.stress)]):
                 p = wm.get_parameters(model=ml, istress=i)
-                gain = wm.rfunc.gain(p) * 1e6 / 365.25  # m per Mm³/year
-                pozo_gains[name] = gain
-            
+                pozo_gains[name] = wm.rfunc.gain(p) * 1e6 / 365.25
             gains_data.append(pozo_gains)
-                  
-    
-    # =========================================================================
-    # 8. EXPORTAR RESULTADOS
-    # =========================================================================
-    
-    # Exportar gains (solo para modelos con WellModel)
-    if modelo not in ["Modelo_A", "Modelo_B"] and gains_data:
-        df_gains = pd.DataFrame(gains_data)
-        df_gains.set_index("pozo", inplace=True)
-        
-        # Agregar fila con media
-        mean_row = df_gains[stress_names[:len(df_gains.columns)]].mean()
-        mean_df = pd.DataFrame([mean_row], index=["mean"])
-        df_gains = pd.concat([df_gains, mean_df])
-        
-        df_gains.to_csv(f"{modelo}_gains_by_pozo.csv")
-        print(f"  Gains exportados: {modelo}_gains_by_pozo.csv")
-    
-    # Exportar estadísticas con IVM
-    df_all_stats = pd.DataFrame.from_dict(model_stats, orient='index')
-    df_model_stats = df_all_stats[df_all_stats.index.get_level_values(1) == modelo].copy()
-    
-    if isinstance(df_model_stats.index, pd.MultiIndex):
-        df_model_stats.index = df_model_stats.index.get_level_values(0)
-    
-    # Calcular IVM
-    df_model_stats["IVM"] = df_model_stats.apply(calculate_ivm, axis=1)
-    
-    # Agregar fila de resumen
-    validos_count = (df_model_stats["IVM"] == "Válido").sum()
-    summary_dict = {col: "" for col in df_model_stats.columns}
-    summary_dict["IVM"] = f"Total Válidos: {validos_count}"
-    summary_row = pd.DataFrame([summary_dict], index=["Summary"])
-    df_model_stats = pd.concat([df_model_stats, summary_row])
-    
-    df_model_stats.to_csv(f"Summary_{modelo}.csv")
-    print(f"  Estadísticas exportadas: Summary_{modelo}.csv")
 
-print("\n=== PROCESO COMPLETADO ===")
-print(f"Total de modelos creados: {len(modelos_individuales)}")
+    return model_stats, gains_data
+
+
+def _run_one_model(modelo: str, location_names: list, bundle: dict):
+    """
+    Wrapper (por modelo): ejecuta create_model_with_data para un tipo de modelo
+    y todos los pozos. Devuelve (modelo, model_stats, gains_data).
+    """
+    model_stats, gains_data = create_model_with_data(modelo, location_names, bundle)
+    return (modelo, model_stats, gains_data)
+
+
+def _run_one_pozo_for_model(modelo: str, pozo: str, bundle: dict):
+    """
+    Wrapper para multiprocessing: ejecuta un solo modelo para un solo pozo.
+    Devuelve (modelo, model_stats, gains_data) con model_stats de una clave (pozo).
+    """
+    model_stats, gains_data = create_model_with_data(modelo, [pozo], bundle)
+    return (modelo, model_stats, gains_data)
+
+
+# =============================================================================
+# 3. CARGA Y PREPARACIÓN DE DATOS DE NIVELES
+# =============================================================================
+# (Todo lo que sigue se ejecuta solo al correr el script, no al importar;
+#  así multiprocessing no vuelve a cargar datos en cada worker.)
+if __name__ == "__main__":
+    t_start = time.perf_counter()
+    print("\n=== 3. CARGANDO DATOS DE NIVELES ===")
+
+    # Leer datos de niveles de pozos
+    niveles_path = os.path.join("datos", "pozos nivel peine", "Niveles.csv")
+    niveles = pd.read_csv(niveles_path, encoding="utf-8-sig")
+
+    # Limpiar y estandarizar datos
+    niveles["Fecha"] = pd.to_datetime(niveles["Fecha"], dayfirst=True, errors="coerce")
+    niveles["Valor"] = pd.to_numeric(niveles["Valor"], errors="coerce")
+    niveles["Pozo"] = niveles["Pozo"].astype(str).str.strip()
+    niveles["Tipo"] = niveles["Tipo"].astype(str).str.strip().str.upper()
+    niveles = niveles.dropna(subset=["Fecha", "Pozo", "Tipo", "Valor"]).copy()
+
+    # Filtrar por fecha de inicio
+    inicio = pd.Timestamp("2010-01-01")
+    final = pd.Timestamp("2023-12-01")
+    niveles = niveles[(niveles["Fecha"] >= inicio) & (niveles["Fecha"] <= final)].copy()
+
+    # Filtrar solo pozos permitidos (según archivo de monitoreo)
+    monitoreo_path = os.path.join("datos", "pozos nivel peine", "monitoreo_total.csv")
+    monitoreo = pd.read_csv(monitoreo_path, encoding="utf-8-sig")
+    allowed = (
+        monitoreo["Nombre"]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"^Pozo\\s+", "", regex=True)
+        .dropna()
+        .unique()
+    )
+    niveles = niveles[niveles["Pozo"].isin(set(allowed))].copy()
+
+    print(f"Total de registros de niveles: {len(niveles)}")
+    print(f"Pozos únicos: {niveles['Pozo'].nunique()}")
+
+    # =========================================================================
+    # 4. ANÁLISIS DE TENDENCIAS (MANN-KENDALL)
+    # =========================================================================
+    print("\n=== 4. ANÁLISIS DE TENDENCIAS ===")
+
+    # Aplicar test a diferentes grupos de pozos
+    exclude_head = {"PP-03", "MP-07C-1", "MP-07A", "L10-1", "PP-01", "MP-08A", "BA-30"}
+
+    mk_head = _mk_table(niveles[(niveles["Tipo"] == "HEAD") & (~niveles["Pozo"].isin(exclude_head))])
+    mk_head_excl = _mk_table(niveles[(niveles["Tipo"] == "HEAD") & (niveles["Pozo"].isin(exclude_head))])
+    mk_stage = _mk_table(niveles[niveles["Tipo"] == "STAGE"])
+
+    # Exportar resultados
+    mk_head.to_csv("resultados_mann_kendall_head.csv", index=False, float_format="%.3f")
+    mk_head_excl.to_csv("resultados_mann_kendall_head_excluidos.csv", index=False, float_format="%.3f")
+    mk_stage.to_csv("resultados_mann_kendall_limnimetricos.csv", index=False, float_format="%.3f")
+
+    print(f"MK HEAD: {len(mk_head)} pozos")
+    print(f"MK HEAD excluidos: {len(mk_head_excl)} pozos")
+    print(f"MK STAGE: {len(mk_stage)} pozos")
+
+    # =========================================================================
+    # 5. CARGA DE DATOS DE ESTRÉS (CLIMA Y BOMBEOS)
+    # =========================================================================
+    print("\n=== 5. CARGANDO DATOS DE ESTRÉS ===")
+
+    # 5.1 Precipitación y Evaporación
+    archivos_precipitacion = [
+        os.path.join('datos', 'resultados_meteo', 'precip', 'Prec_CHAXA.csv'),
+        os.path.join('datos', 'resultados_meteo', 'precip', 'Prec_LZA9-1 (Interna).csv'),
+        os.path.join('datos', 'resultados_meteo', 'precip', 'Prec_LZA10-1.csv')
+    ]
+    archivos_evaporacion = [
+        os.path.join('datos', 'resultados_meteo', 'evap', 'Evap_CHAXA.csv'),
+        os.path.join('datos', 'resultados_meteo', 'evap', 'Evap_LZA9-1 (Interna).csv')
+    ]
+
+    # Concatenar y promediar múltiples estaciones
+    precipitacion_list = [pd.read_csv(archivo, index_col=0, parse_dates=True).squeeze("columns")
+                          for archivo in archivos_precipitacion]
+    precipitacion = pd.concat(precipitacion_list).groupby(level=0).mean()
+
+    evaporacion_list = [pd.read_csv(archivo, index_col=0, parse_dates=True).squeeze("columns")
+                        for archivo in archivos_evaporacion]
+    evaporacion = pd.concat(evaporacion_list).groupby(level=0).mean()
+
+    # 5.2 Datos de Bombeo (usando función auxiliar)
+    print("Cargando datos de bombeo...")
+    ALB_series = load_pumping_data(os.path.join("datos", "pumping", "alb_pump.csv"))
+    SOP_series = load_pumping_data(os.path.join("datos", "pumping", "SOP_monthly_m3.csv"))
+    MOP_series = load_pumping_data(os.path.join("datos", "pumping", "MOP_monthly_m3.csv"))
+    TIL_series = load_pumping_data(os.path.join("datos", "pumping", "tilopozo_pumping.csv"))
+    TUC_series = load_pumping_data(os.path.join("datos", "pumping", "tucucaro_pumping.csv"))
+    PEINE_series = load_pumping_data(os.path.join("datos", "pumping", "Pozo_peine_pumping.csv"))
+
+    # Organizar series de bombeo
+    bombeos_dic = {
+        "alb": ALB_series, "sop": SOP_series, "mop": MOP_series,
+        "til": TIL_series, "tuc": TUC_series, "peine": PEINE_series
+    }
+    list_of_bombeos = [ALB_series, SOP_series, MOP_series, TIL_series, TUC_series, PEINE_series]
+    stress_names = ["alb", "sop", "mop", "til", "tuc", "peine"]
+
+    # 5.3 Preparar clima para modelos (resample a diario)
+    precipitacion.index = pd.to_datetime(precipitacion.index, errors="coerce")
+    precipitacion = precipitacion.dropna().sort_index()
+    precipitacion_monthly = precipitacion.resample("D").sum()
+
+    evaporacion.index = pd.to_datetime(evaporacion.index, errors="coerce")
+    evaporacion = evaporacion.dropna().sort_index()
+    evaporacion_monthly = evaporacion.resample("D").mean()
+
+    # Preparar series para modelos Pastas
+    prec = precipitacion.dropna().sort_index().resample("D").sum()
+    evap = evaporacion.dropna().sort_index().resample("D").mean()
+
+    # Crear StressModels para clima
+    coef = 0.225  # Coeficiente de infiltracion SRK Consulting (2020) Zona Marginal (promedio)
+    sm_precip = ps.StressModel(prec * coef, ps.Gamma(), settings="prec", name="precipitacion")
+    sm_evap = ps.StressModel(evap, ps.Gamma(), settings="evap", name="evaporacion")
+
+    print("Datos de estrés cargados correctamente")
+
+    # =========================================================================
+    # 6. CARGA DE COORDENADAS
+    # =========================================================================
+    print("\n=== 6. CARGANDO COORDENADAS ===")
+
+    coordenadas_bombeos_path = os.path.join("datos", "pumping", "bombeos_ubicacion.csv")
+    coordenadas_bombeos = pd.read_csv(coordenadas_bombeos_path, encoding="utf-8-sig")
+    try:
+        coordenadas_bombeos.set_index("Nombre", inplace=True)
+    except Exception as e:
+        print(f"Error loading coordenadas_bombeos: {e}")
+        raise
+
+    coordenadas_niveles_path = os.path.join("datos", "pozos nivel peine", "monitoreo_total.csv")
+    try:
+        coordenadas_niveles = pd.read_csv(coordenadas_niveles_path, encoding="utf-8-sig")
+        if "Nombre" in coordenadas_niveles.columns:
+            coordenadas_niveles.set_index("Nombre", inplace=True)
+        else:
+            print(f"Warning: 'Nombre' column not found. Available columns: {coordenadas_niveles.columns.tolist()}")
+            if "nombre" in coordenadas_niveles.columns.str.lower():
+                col_name = coordenadas_niveles.columns[coordenadas_niveles.columns.str.lower() == "nombre"][0]
+                coordenadas_niveles.set_index(col_name, inplace=True)
+    except Exception as e:
+        print(f"Error loading coordenadas_niveles: {e}")
+        raise
+
+    print(f"Coordenadas de {len(coordenadas_bombeos)} bombeos cargadas")
+    print(f"Coordenadas de {len(coordenadas_niveles)} pozos cargadas")
+
+    # -------------------------------------------------------------------------
+    # 8. EJECUCIÓN: modelos secuencial (A, B, C...), pozos en paralelo
+    # -------------------------------------------------------------------------
+    # Bucle de modelos secuencial; para cada modelo, todos los pozos se procesan
+    # en paralelo (cada worker = un pozo para ese modelo).
+    Modelos = ["Modelo_A", "Modelo_B", "Modelo_C", "Modelo_D", "Modelo_E"]
+    niveles_series = niveles.copy()
+    niveles_series.set_index("Fecha", inplace=True)
+    location_names = sorted(niveles["Pozo"].unique().tolist())
+    # Para probar con un pozo: 
+    # location_names = ["2018"]
+
+    bundle = get_data_bundle()
+
+    total_modelos = 0
+    for modelo in Modelos:
+        print(f"\n--- {modelo} ---")
+        if N_WORKERS <= 1:
+            # Secuencial: un pozo tras otro para este modelo
+            results = []
+            for pozo in location_names:
+                results.append(_run_one_pozo_for_model(modelo, pozo, bundle))
+        else:
+            # Paralelo: todos los pozos para este modelo en paralelo
+            with Pool(N_WORKERS) as pool:
+                results = pool.starmap(
+                    _run_one_pozo_for_model,
+                    [(modelo, pozo, bundle) for pozo in location_names],
+                )
+
+        # Agregar y exportar para este modelo
+        model_stats = {}
+        gains_data = []
+        for (m, stats, gains) in results:
+            model_stats.update(stats)
+            gains_data.extend(gains)
+        total_modelos += len(model_stats)
+
+        df_stats = pd.DataFrame.from_dict(model_stats, orient="index")
+        df_stats["IVM"] = df_stats.apply(calculate_ivm, axis=1)
+        summary_row = pd.DataFrame([{c: "" for c in df_stats.columns}], index=["Summary"])
+        summary_row["IVM"] = f"Total Válidos: {(df_stats['IVM'] == 'Válido').sum()}"
+        df_stats = pd.concat([df_stats, summary_row])
+        df_stats.to_csv(f"Summary_{modelo}.csv")
+        print(f"  Guardado: Summary_{modelo}.csv")
+        if modelo in ["Modelo_C", "Modelo_D", "Modelo_E"] and gains_data:
+            df_gains = pd.DataFrame(gains_data).set_index("pozo")
+            df_gains = pd.concat([df_gains, pd.DataFrame([df_gains.mean()], index=["mean"])])
+            df_gains.to_csv(f"{modelo}_gains_by_pozo.csv")
+            print(f"  Guardado: {modelo}_gains_by_pozo.csv")
+
+    elapsed = time.perf_counter() - t_start
+    print("\n=== PROCESO COMPLETADO ===")
+    print(f"Total de modelos creados: {total_modelos}")
+    if elapsed >= 60:
+        mins = int(elapsed // 60)
+        secs = elapsed % 60
+        print(f"Tiempo total: {mins}m {secs:.1f}s")
+    else:
+        print(f"Tiempo total: {elapsed:.1f}s")
